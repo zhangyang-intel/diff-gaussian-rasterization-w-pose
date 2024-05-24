@@ -106,8 +106,8 @@ __forceinline__ __device__ float dnormvdz(float3 v, float3 dv)
 
 __forceinline__ __device__ float3 dnormvdv(float3 v, float3 dv)
 {
-	float sum2 = v.x * v.x + v.y * v.y + v.z * v.z;
-	float invsum32 = 1.0f / sqrt(sum2 * sum2 * sum2);
+	float sum2 = v.x * v.x + v.y * v.y + v.z * v.z; 	// sum2 = ||dir||^2
+	float invsum32 = 1.0f / sqrt(sum2 * sum2 * sum2);	// invsum32 = 1 / ||dir||^(3/2)
 
 	float3 dnormvdv;
 	dnormvdv.x = ((+sum2 - v.x * v.x) * dv.x - v.y * v.x * dv.y - v.z * v.x * dv.z) * invsum32;
@@ -136,21 +136,25 @@ __forceinline__ __device__ float sigmoid(float x)
 	return 1.0f / (1.0f + expf(-x));
 }
 
-__forceinline__ __device__ bool in_frustum(int idx,
-	const float* orig_points,
-	const float* viewmatrix,
-	const float* projmatrix,
-	bool prefiltered,
-	float3& p_view)
+__forceinline__ __device__ bool in_frustum(int idx,	// 3D高斯的索引
+	const float* orig_points,					    // 所有3D高斯的位置均值
+	const float* viewmatrix,						// 视图矩阵T_CW
+	const float* projmatrix,						// 经过视图矩阵和投影矩阵相乘后得到的最终投影变换矩阵T_IW
+	bool prefiltered,								// 是否预过滤
+	float3& p_view)									// 当前3D高斯位置均值在相机系下的坐标
 {
+	// 当前3D高斯的位置均值(x,y,z)
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
 
 	// Bring points to screen space
+	// 当前3D高斯位置均值从世界系转换到图像系
 	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
-	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
+	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };   // (x,y,z) -> (x,y,z,w) -> (x/w,y/w,z/w)
+	// 当前3D高斯位置均值从世界系转换到相机系
 	p_view = transformPoint4x3(p_orig, viewmatrix);
 
+	// 剔除距离相机太近的高斯
 	if (p_view.z <= 0.2f)// || ((p_proj.x < -1.3 || p_proj.x > 1.3 || p_proj.y < -1.3 || p_proj.y > 1.3)))
 	{
 		if (prefiltered)

@@ -196,57 +196,59 @@ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chun
 // Forward rendering procedure for differentiable rasterization
 // of Gaussians.
 int CudaRasterizer::Rasterizer::forward(
-	std::function<char* (size_t)> geometryBuffer,
+	std::function<char* (size_t)> geometryBuffer,			// 3个缓冲区函数
 	std::function<char* (size_t)> binningBuffer,
 	std::function<char* (size_t)> imageBuffer,
-	const int P, int D, int M,
-	const float* background,
-	const int width, int height,
-	const float* means3D,
-	const float* shs,
-	const float* colors_precomp,
-	const float* opacities,
-	const float* scales,
-	const float scale_modifier,
-	const float* rotations,
-	const float* cov3D_precomp,
-	const float* viewmatrix,
-	const float* projmatrix,
-	const float* cam_pos,
-	const float tan_fovx, float tan_fovy,
-	const bool prefiltered,
-	float* out_color,
-	float* out_depth,
-	float* out_opacity,
-	int* radii,
-	int* n_touched,
-	bool debug)
+	const int P, int D, int M,								// 3D高斯的数量，球谐函数的阶数，球谐系数的数量
+	const float* background,								// 背景颜色
+	const int width, int height,							// 图像的宽和高
+	const float* means3D,									// 3D高斯的位置均值
+	const float* shs,										// 球谐系数
+	const float* colors_precomp,							// 预计算的高斯颜色
+	const float* opacities,									// 3D高斯的不透明度
+	const float* scales,									// 3D高斯的缩放
+	const float scale_modifier,								// 3D高斯的缩放修正
+	const float* rotations,									// 3D高斯的旋转
+	const float* cov3D_precomp,								// 预计算的3D高斯的协方差矩阵
+	const float* viewmatrix,								// 视图矩阵T_CW
+	const float* projmatrix,								// 经过视图矩阵和投影矩阵相乘后得到的最终投影变换矩阵T_IW
+	const float* cam_pos,									// 相机位置
+	const float tan_fovx, float tan_fovy,					// 相机水平视场角和垂直视场角
+	const bool prefiltered,									// 是否预过滤
+	float* out_color,										// 输出的图像颜色
+	float* out_depth,										// 输出的深度图
+	float* out_opacity,										// 输出的不透明度图（曝光）
+	int* radii,												// 2D高斯椭圆的半径
+	int* n_touched,											// 每个3D高斯触及到的像素数量
+	bool debug)												// 是否调试
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
+	// 初始化一些缓冲区
 	size_t chunk_size = required<GeometryState>(P);
 	char* chunkptr = geometryBuffer(chunk_size);
-	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);    // 读取3D高斯的几何信息
 
 	if (radii == nullptr)
 	{
 		radii = geomState.internal_radii;
 	}
 
-	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
-	dim3 block(BLOCK_X, BLOCK_Y, 1);
+	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);	// x和y方向上栅格的个数
+	dim3 block(BLOCK_X, BLOCK_Y, 1);														// 每个栅格的像素大小(线程数)
 
 	// Dynamically resize image-based auxiliary buffers during training
 	size_t img_chunk_size = required<ImageState>(width * height);
 	char* img_chunkptr = imageBuffer(img_chunk_size);
-	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
+	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);	// 读取图像信息
 
 	if (NUM_CHANNELS != 3 && colors_precomp == nullptr)
 	{
 		throw std::runtime_error("For non-RGB, provide precomputed Gaussian colors!");
 	}
 
+	// 渲染前的预处理
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
 	CHECK_CUDA(FORWARD::preprocess(
 		P, D, M,
@@ -277,18 +279,22 @@ int CudaRasterizer::Rasterizer::forward(
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
+	// 计算每一个栅格被多少个3D高斯触及到geomState.point_offsets
+	// 计算出每个高斯对应的keys和values在数组中的起始位置
 	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
 
 	// Retrieve total number of Gaussian instances to launch and resize aux buffers
+	// 计算被渲染的高斯总数
 	int num_rendered;
 	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
-
+	// 调整缓冲区大小
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
 	// For each instance to be rendered, produce adequate [ tile | depth ] key 
 	// and corresponding dublicated Gaussian indices to be sorted
+	// 根据每个3D高斯在相机系下的深度，生成排序所用的keys和values [tile | depth]
 	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
 		P,
 		geomState.means2D,
@@ -303,6 +309,7 @@ int CudaRasterizer::Rasterizer::forward(
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
 
 	// Sort complete list of (duplicated) Gaussian indices by keys
+	// 进行排序，按keys排序：每个栅格对应的高斯按深度放在一起；value是Gaussian的ID
 	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
 		binningState.list_sorting_space,
 		binningState.sorting_size,
@@ -313,6 +320,7 @@ int CudaRasterizer::Rasterizer::forward(
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
 
 	// Identify start and end of per-tile workloads in sorted list
+	// 计算每个栅格对应排序过的数组中的哪一部分
 	if (num_rendered > 0)
 		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
 			num_rendered,
@@ -321,7 +329,8 @@ int CudaRasterizer::Rasterizer::forward(
 	CHECK_CUDA(, debug)
 
 	// Let each tile blend its range of Gaussians independently in parallel
-	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;  // 3D高斯的颜色
+	// 并行渲染图像
 	CHECK_CUDA(FORWARD::render(
 		tile_grid, block,
 		imgState.ranges,
@@ -339,68 +348,70 @@ int CudaRasterizer::Rasterizer::forward(
 		out_opacity,
 		n_touched
     ), debug)
-
+	// 返回被渲染的高斯总数
 	return num_rendered;
 }
 
 // Produce necessary gradients for optimization, corresponding
 // to forward render pass
 void CudaRasterizer::Rasterizer::backward(
-	const int P, int D, int M, int R,
-	const float* background,
-	const int width, int height,
-	const float* means3D,
-	const float* shs,
-	const float* colors_precomp,
-	const float* scales,
-	const float scale_modifier,
-	const float* rotations,
-	const float* cov3D_precomp,
-	const float* viewmatrix,
-	const float* projmatrix,
-    const float* projmatrix_raw,
-    const float* campos,
-	const float tan_fovx, float tan_fovy,
-	const int* radii,
-	char* geom_buffer,
-	char* binning_buffer,
-	char* img_buffer,
-	const float* dL_dpix,
-	const float* dL_dpix_depth,
-	float* dL_dmean2D,
-	float* dL_dconic,
-	float* dL_dopacity,
-	float* dL_dcolor,
-	float* dL_ddepth,
-	float* dL_dmean3D,
-	float* dL_dcov3D,
-	float* dL_dsh,
-	float* dL_dscale,
-	float* dL_drot,
-	float* dL_dtau,
-	bool debug)
+	const int P, int D, int M, int R,       	 			// 3D高斯的数量，球谐函数的阶数，球谐系数的数量，被渲染的高斯数量
+	const float* background,								// 背景颜色
+	const int width, int height,							// 图像的宽和高
+	const float* means3D,									// 3D高斯的位置均值
+	const float* shs,										// 球谐系数
+	const float* colors_precomp,							// 预计算的高斯颜色
+	const float* scales,									// 3D高斯的缩放
+	const float scale_modifier,								// 3D高斯的缩放修正
+	const float* rotations,									// 3D高斯的旋转
+	const float* cov3D_precomp,								// 预计算的3D高斯的协方差矩阵
+	const float* viewmatrix,								// 视图矩阵T_CW
+	const float* projmatrix,								// 经过视图矩阵和投影矩阵相乘后得到的最终投影变换矩阵T_IW
+    const float* projmatrix_raw,							// 原始投影矩阵T_IC
+    const float* campos,									// 相机位置
+	const float tan_fovx, float tan_fovy,					// 相机水平视场角和垂直视场角
+	const int* radii,										// 2D高斯椭圆的半径
+	char* geom_buffer,										// 高斯几何信息的缓冲区
+	char* binning_buffer,									// 光栅化的缓冲区
+	char* img_buffer,										// 图像信息的缓冲区
+	const float* dL_dpix,									// RGB图像的梯度
+	const float* dL_dpix_depth,								// 深度图像的梯度
+	float* dL_dmean2D,										// 2D高斯的位置均值的梯度
+	float* dL_dconic,										// 2D高斯协方差的梯度
+	float* dL_dopacity,										// 3D高斯不透明度的梯度
+	float* dL_dcolor,										// 3D高斯颜色的梯度
+	float* dL_ddepth,										// 3D高斯在相机系下深度的梯度
+	float* dL_dmean3D,										// 3D高斯位置均值的梯度
+	float* dL_dcov3D,										// 3D高斯协方差的梯度
+	float* dL_dsh,											// sh系数的梯度
+	float* dL_dscale,										// 3D高斯缩放的梯度
+	float* dL_drot,											// 3D高斯旋转的梯度
+	float* dL_dtau,											// 相机位姿的梯度
+	bool debug)												// 是否调试
 {
+	// 读取缓冲区中储存的信息
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
 	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
-
+	
+	// 2D高斯的半径
 	if (radii == nullptr)
 	{
 		radii = geomState.internal_radii;
 	}
 
-	const float focal_y = height / (2.0f * tan_fovy);
-	const float focal_x = width / (2.0f * tan_fovx);
+	const float focal_y = height / (2.0f * tan_fovy);	// 相机y方向焦距
+	const float focal_x = width / (2.0f * tan_fovx);	// 相机x方向焦距
 
-	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
-	const dim3 block(BLOCK_X, BLOCK_Y, 1);
+	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1); // x和y方向上栅格的个数
+	const dim3 block(BLOCK_X, BLOCK_Y, 1);														// 每个栅格的像素大小(线程数)
 
 	// Compute loss gradients w.r.t. 2D mean position, conic matrix,
 	// opacity and RGB of Gaussians from per-pixel loss gradients.
 	// If we were given precomputed colors and not SHs, use them.
-	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
-    const float* depth_ptr = geomState.depths;
-
+	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;	// 3D高斯的颜色
+    const float* depth_ptr = geomState.depths;												// 3D高斯在相机系下的深度
+	/**********************************光栅化渲染的反响传播函数****************************************/
 	CHECK_CUDA(BACKWARD::render(
 		tile_grid,
 		block,
@@ -426,7 +437,8 @@ void CudaRasterizer::Rasterizer::backward(
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
 	// use the one we computed ourselves.
-	const float* cov3D_ptr = (cov3D_precomp != nullptr) ? cov3D_precomp : geomState.cov3D;
+	const float* cov3D_ptr = (cov3D_precomp != nullptr) ? cov3D_precomp : geomState.cov3D;	// 3D高斯的协方差
+	/**********************************预处理的反响传播函数****************************************/
 	CHECK_CUDA(BACKWARD::preprocess(P, D, M,
 		(float3*)means3D,
 		radii,
